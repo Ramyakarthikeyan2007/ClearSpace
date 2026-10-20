@@ -1,0 +1,14 @@
+{
+  "theme": "Emerald Cream",
+  "default_scan_path": "",
+  "skip_hidden_files": true,
+  "use_recycle_bin": true,
+  "max_scan_depth": 20,
+  "safe_mode": true,
+  "last_scan_summary": {
+    "folder_path": "",
+    "total_files": 0,
+    "total_size_human": "0 B",
+    "scanned_at": ""
+  }
+}

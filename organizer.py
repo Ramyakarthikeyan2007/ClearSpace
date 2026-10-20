@@ -1,0 +1,193 @@
+"""
+organizer.py - Safe File Organization for ClearSpace
+===================================================
+Generates transparent file reorganization plans based on recognized file types.
+Provides complete pre-move previews, dry-run simulation, and collision-free
+relocation without ever overwriting existing files.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Set
+
+from safety import get_safe_destination, is_safe_directory, safe_move_file, validate_move_path
+from scanner import CATEGORY_EXTENSIONS, get_file_category
+
+
+ORGANIZATION_CATEGORIES = list(CATEGORY_EXTENSIONS.keys()) + ["Others"]
+
+
+def generate_organization_plan(
+    files: List[Dict[str, Any]],
+    target_base_dir: str | Path,
+    selected_categories: Optional[List[str]] = None,
+    group_by_extension: bool = False,
+) -> Dict[str, Any]:
+    """
+    Build a comprehensive preview plan for organizing files.
+    DOES NOT move or touch any files on disk.
+
+    Parameters:
+        files: List of file dictionaries (from scanner).
+        target_base_dir: Destination root folder for organized files.
+        selected_categories: Which categories to include (defaults to all).
+        group_by_extension: If True, organizes into Category/Extension/ (e.g., Documents/pdf/)
+
+    Returns:
+        dict: {
+            "plan_items": list of proposed move actions,
+            "total_items": int,
+            "target_dir": str,
+            "categories_involved": list[str],
+            "collisions_avoided": int,
+            "is_valid": bool,
+            "validation_message": str,
+        }
+    """
+    target_dir = Path(target_base_dir).expanduser().resolve()
+    categories_set = set(selected_categories) if selected_categories else set(ORGANIZATION_CATEGORIES)
+
+    plan_items: List[Dict[str, Any]] = []
+    collisions_avoided = 0
+
+    # Track virtual destinations during planning so multiple incoming files with the
+    # same name in different subfolders don't collide when planned for the same target!
+    planned_destinations: Set[str] = set()
+
+    for f in files:
+        category = f.get("category", "Others")
+        if category not in categories_set:
+            continue
+
+        src_path = Path(f.get("path"))
+        filename = f.get("filename", src_path.name)
+        extension = f.get("extension", src_path.suffix).lstrip(".")
+
+        # Compute destination category folder
+        if group_by_extension and extension and extension != "(no ext)":
+            dest_folder = target_dir / category / extension
+        else:
+            dest_folder = target_dir / category
+
+        # Check collision against disk and against previously planned items in this run
+        tentative_target = dest_folder / filename
+        counter = 1
+        stem = tentative_target.stem
+        suffix = tentative_target.suffix
+
+        while tentative_target.exists() or str(tentative_target).lower() in planned_destinations:
+            # If the source file is already at this exact target, it's not a collision
+            if src_path.resolve() == tentative_target.resolve():
+                break
+            tentative_target = dest_folder / f"{stem} ({counter}){suffix}"
+            counter += 1
+
+        is_renamed = tentative_target.name != filename
+        if is_renamed:
+            collisions_avoided += 1
+
+        planned_destinations.add(str(tentative_target).lower())
+
+        # Check if file is already at destination
+        already_organized = (src_path.resolve() == tentative_target.resolve())
+
+        plan_items.append({
+            "source": str(src_path),
+            "filename": filename,
+            "category": category,
+            "size_bytes": f.get("size_bytes", 0),
+            "size_human": f.get("size_human", "0 B"),
+            "target_directory": str(dest_folder),
+            "target_path": str(tentative_target),
+            "target_filename": tentative_target.name,
+            "is_renamed": is_renamed,
+            "already_organized": already_organized,
+        })
+
+    active_moves = [item for item in plan_items if not item["already_organized"]]
+
+    return {
+        "plan_items": plan_items,
+        "active_moves": active_moves,
+        "total_items": len(plan_items),
+        "total_active_moves": len(active_moves),
+        "target_dir": str(target_dir),
+        "categories_involved": sorted(list(categories_set)),
+        "collisions_avoided": collisions_avoided,
+        "is_valid": True,
+        "validation_message": f"Planned {len(active_moves)} file relocations ({collisions_avoided} renames for safety).",
+    }
+
+
+def execute_organization_plan(
+    plan: Dict[str, Any],
+    dry_run: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Execute a previously reviewed organization plan.
+
+    Parameters:
+        plan: The plan dictionary generated by generate_organization_plan.
+        dry_run: If True, validates moves without actually touching disk.
+        progress_callback: Optional func(current, total, filename) for progress bar.
+
+    Returns:
+        dict: Execution report with success_count, skipped_count, error_count, and logs.
+    """
+    items = plan.get("active_moves", [])
+    total = len(items)
+
+    success_count = 0
+    skipped_count = 0
+    error_count = 0
+    logs: List[Dict[str, Any]] = []
+
+    for idx, item in enumerate(items, start=1):
+        src = item["source"]
+        target_dir = item["target_directory"]
+        custom_name = item["target_filename"]
+
+        if progress_callback:
+            progress_callback(idx, total, item["filename"])
+
+        if item.get("already_organized"):
+            skipped_count += 1
+            logs.append({
+                "status": "skipped",
+                "source": src,
+                "message": "File is already in the target location.",
+            })
+            continue
+
+        result = safe_move_file(
+            source_path=src,
+            target_dir=target_dir,
+            custom_filename=custom_name,
+            dry_run=dry_run,
+        )
+
+        if result["status"] in ("success", "dry_run"):
+            success_count += 1
+        elif result["status"] == "skipped":
+            skipped_count += 1
+        else:
+            error_count += 1
+
+        logs.append(result)
+
+    return {
+        "dry_run": dry_run,
+        "total": total,
+        "success_count": success_count,
+        "skipped_count": skipped_count,
+        "error_count": error_count,
+        "logs": logs,
+        "message": (
+            f"[Dry-Run] Simulated {success_count} moves successfully."
+            if dry_run else
+            f"Successfully organized {success_count} files ({error_count} errors, {skipped_count} skipped)."
+        ),
+    }
